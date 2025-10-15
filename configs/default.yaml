@@ -1,0 +1,21 @@
+# configs/default.yaml
+project: "CISC_473_project"
+seed: 42
+
+paths:
+  data_root: "/content/drive/MyDrive/projects/CISC_473_project_data"
+  repo_dir: "/content/drive/MyDrive/projects/CISC_473_project/"
+  out_dir: "outputs/run1"
+  checkpoints_dir: "checkpoints/run1"
+
+data:
+  patch_size: 128
+  batch_size: 16
+  noise_sigma: 25
+
+train:
+  epochs: 50
+  lr: 3e-4
+  optimizer: "adamw"
+  weight_decay: 0.01
+  save_every: 5
