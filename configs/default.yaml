@@ -2,15 +2,6 @@
 project: "CISC_473_project"
 seed: 42
 
-paths:
-  repo_dir: "/home/colin/projects/CISC_473_project"
-  data_root: "/home/colin/projects/CISC_473_project_data"
-  # Ideally i rememberd to change this back to google drive version before push
-  # data_root: "/content/drive/MyDrive/projects/CISC_473_project_data"
-  # repo_dir: "/content/drive/MyDrive/projects/CISC_473_project/"
-  out_dir: "/home/colin/projects/CISC_473_project/outputs/run1"
-  save_dir: "/home/colin/projects/CISC_473_project/checkpoints/run1"
-
 data:
   patch_size: 128
   batch_size: 16
