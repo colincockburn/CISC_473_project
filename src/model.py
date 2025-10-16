@@ -1,4 +1,3 @@
-# src/model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,8 +36,7 @@ class Up(nn.Module):
 
     def forward(self, x, skip):
         x = self.up(x)
-        x = self.proj(x)  # now x and skip have same channel count
-        # safe pad (assumes skip is target size)
+        x = self.proj(x)  
         dh = skip.shape[-2] - x.shape[-2]
         dw = skip.shape[-1] - x.shape[-1]
         if dh != 0 or dw != 0:
@@ -51,17 +49,17 @@ class UNetDenoise(nn.Module):
     def __init__(self, in_ch=3, out_ch=3, base_ch=64):
         super().__init__()
         # encoder
-        self.inc   = DoubleConv(in_ch, base_ch)              # C=1b
-        self.down1 = Down(base_ch, base_ch * 2)              # C=2b
-        self.down2 = Down(base_ch * 2, base_ch * 4)          # C=4b
-        self.down3 = Down(base_ch * 4, base_ch * 8)          # C=8b
+        self.inc   = DoubleConv(in_ch, base_ch)              
+        self.down1 = Down(base_ch, base_ch * 2)             
+        self.down2 = Down(base_ch * 2, base_ch * 4)         
+        self.down3 = Down(base_ch * 4, base_ch * 8)     
         # bottleneck
         self.bottleneck = DoubleConv(base_ch * 8, base_ch * 16)  # C=16b
-        # decoder (make C_up == C_skip before concat)
-        self.up3 = Up(base_ch * 16, base_ch * 8)          # (8b+8b)->8b
-        self.up2 = Up(base_ch * 8,  base_ch * 4)          # (4b+4b)->4b
-        self.up1 = Up(base_ch * 4,  base_ch * 2)          # (2b+2b)->2b
-        self.up0 = Up(base_ch * 2,  base_ch)              # (1b+1b)->1b
+        # decoder 
+        self.up3 = Up(base_ch * 16, base_ch * 8)   
+        self.up2 = Up(base_ch * 8,  base_ch * 4)
+        self.up1 = Up(base_ch * 4,  base_ch * 2)
+        self.up0 = Up(base_ch * 2,  base_ch)
         # head
         self.outc = nn.Conv2d(base_ch, out_ch, kernel_size=1)
 
