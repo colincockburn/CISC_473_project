@@ -2,6 +2,7 @@
 import os, math, argparse, time, random
 import numpy as np
 from pathlib import Path
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -31,48 +32,41 @@ def save_ckpt(state, save_dir, tag):
     return str(path)
 
 # ------------------------- train/eval steps -------------------------
-
 def run_epoch(model, loader, optimizer, device, train=True, grad_clip=0.0, criterion=nn.MSELoss()):
-  
     model.train(train)
     loss_meter, psnr_meter, n = 0.0, 0.0, 0
+    mode = "train" if train else "val"
 
-    for noisy, clean in loader:
-        print(f"[{i+1}/{len(loader)}] Loss: {loss.item():.4f}, PSNR: {batch_psnr.item():.2f}")
+    # Create progress bar instance
+    pbar = tqdm(loader, desc=f"{mode} epoch", leave=False, dynamic_ncols=True)
+
+    for noisy, clean in pbar:
         noisy = noisy.to(device, non_blocking=True)
         clean = clean.to(device, non_blocking=True)
 
         if train:
             optimizer.zero_grad(set_to_none=True)
-
-            # Forward pass
             out = model(noisy)
             loss = criterion(out, clean)
-
-            # Backpropagation
             loss.backward()
-
-            # # Optional gradient clipping
-            # if grad_clip > 0:
-            #     nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-            # Parameter update
             optimizer.step()
         else:
             with torch.no_grad():
                 out = model(noisy)
                 loss = criterion(out, clean)
 
-        # Compute PSNR metric
         with torch.no_grad():
             batch_psnr = psnr(out, clean)
 
-        # Accumulate statistics
         bs = noisy.size(0)
         loss_meter += loss.item() * bs
         psnr_meter += batch_psnr.item() * bs
         n += bs
 
+        pbar.set_postfix(loss=f"{loss.item():.4f}", psnr=f"{batch_psnr.item():.2f}")
+
+    if n == 0:
+        raise ValueError("No samples processed — check DataLoader or loop indentation.")
     return loss_meter / n, psnr_meter / n
 
 # ------------------------- main -------------------------
@@ -103,7 +97,7 @@ def main():
     # ------------------ datasets ------------------
     train_set = Div2kDataSet(root=args.data_root, split="train",
                              patch_size=args.patch_size, sigma=args.sigma, augment=True)
-    val_set = Div2kDataSet(root=args.data_root, split="val",
+    val_set = Div2kDataSet(root=args.data_root, split="valid",
                                patch_size=args.patch_size, sigma=args.sigma, augment=False)
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,

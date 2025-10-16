@@ -42,7 +42,6 @@ class Up(nn.Module):
 
 
 class UNetDenoise(nn.Module):
-    """Symmetric U-Net for RGB denoising (predicts residual noise)."""
     def __init__(self, in_ch=3, out_ch=3, base_ch=64):
         super().__init__()
         # encoder
