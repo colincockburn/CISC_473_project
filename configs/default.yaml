@@ -6,7 +6,7 @@ paths:
   data_root: "/content/drive/MyDrive/projects/CISC_473_project_data"
   repo_dir: "/content/drive/MyDrive/projects/CISC_473_project/"
   out_dir: "outputs/run1"
-  checkpoints_dir: "checkpoints/run1"
+  save_dir: "checkpoints/run1"
 
 data:
   patch_size: 128

@@ -23,26 +23,23 @@ class Down(nn.Module):
     def forward(self, x): return self.conv(self.pool(x))
 
 class Up(nn.Module):
-    """
-    Bilinear upsample -> 1x1 projection to match skip channels (C_up -> C_skip)
-    -> concat -> DoubleConv(2*C_skip -> C_out). For symmetric U-Net set C_out=C_skip.
-    """
     def __init__(self, c_in, c_skip, c_out=None):
         super().__init__()
-        if c_out is None: c_out = c_skip
-        self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
-        self.proj = nn.Conv2d(c_in, c_skip, kernel_size=1, bias=False)
+        if c_out is None:
+            c_out = c_skip
+        # learnable upsampling that doubles H and W exactly
+        self.up = nn.ConvTranspose2d(c_in, c_skip, kernel_size=2, stride=2)
         self.conv = DoubleConv(2 * c_skip, c_out)
 
     def forward(self, x, skip):
         x = self.up(x)
-        x = self.proj(x)  
+        # make sure the skip feature and upsampled feature align perfectly
         dh = skip.shape[-2] - x.shape[-2]
         dw = skip.shape[-1] - x.shape[-1]
         if dh != 0 or dw != 0:
-            assert dh >= 0 and dw >= 0, "upsample larger than skip; check pooling/upsample"
             x = F.pad(x, (0, dw, 0, dh))
         return self.conv(torch.cat([skip, x], dim=1))
+
 
 class UNetDenoise(nn.Module):
     """Symmetric U-Net for RGB denoising (predicts residual noise)."""
