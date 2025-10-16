@@ -38,8 +38,8 @@ class Div2kDataSet(Dataset):
       noisy = np.clip(img + noise, 0, 1)
 
       # ---- convert to tensors ----
-      clean_t = torch.from_numpy(img).permute(2,0,1)
-      noisy_t = torch.from_numpy(noisy).permute(2,0,1)
+      clean_t = torch.from_numpy(img).permute(2,0,1).float()
+      noisy_t = torch.from_numpy(noisy).permute(2,0,1).float()
 
       return noisy_t, clean_t
       

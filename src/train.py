@@ -11,6 +11,8 @@ from torch.utils.data import DataLoader
 from src.data import Div2kDataSet
 from src.model import UNetDenoise
 
+def print_thing():
+  print("ok")
 # ------------------------- utils -------------------------
 def set_seed(seed=1337):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
@@ -36,6 +38,7 @@ def run_epoch(model, loader, optimizer, device, train=True, grad_clip=0.0, crite
     loss_meter, psnr_meter, n = 0.0, 0.0, 0
 
     for noisy, clean in loader:
+        print(f"[{i+1}/{len(loader)}] Loss: {loss.item():.4f}, PSNR: {batch_psnr.item():.2f}")
         noisy = noisy.to(device, non_blocking=True)
         clean = clean.to(device, non_blocking=True)
 
@@ -121,6 +124,7 @@ def main():
         best_psnr = ckpt.get("best_psnr", best_psnr)
         print(f"Resumed from {args.resume} @ epoch {start_epoch}, best_psnr={best_psnr:.3f}")
 
+    print("starting loop")
     # ------------------ training loop ------------------
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
