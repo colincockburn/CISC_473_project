@@ -1,9 +1,7 @@
 outputs/
 checkpoints/
-*.pt
-*.ckpt
-*.log
 __pycache__/
 .ipynb_checkpoints/
 .env
 data/
+473.yml

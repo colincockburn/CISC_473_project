@@ -1,5 +1,5 @@
 # train.py
-import os, math, argparse, time, random
+import argparse, time, random, copy
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
@@ -8,21 +8,31 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-# Adjust these imports to match your filenames if different:
-from src.data import Div2kDataSet
-from src.model import UNetDenoise
+import torch.ao.quantization as tq
+from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx
 
-def print_thing():
-  print("ok")
+from src.data import Div2kDataSet
+from src.model import (
+    UNetDenoise,
+    apply_channel_pruning,
+    apply_unstructured_pruning,
+    bake_unstructured_pruning,
+)
+
+
 # ------------------------- utils -------------------------
 def set_seed(seed=1337):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
 
 @torch.no_grad()
 def psnr(batch_pred, batch_gt, eps=1e-8):
-    # inputs in [0,1]
-    mse = torch.mean((batch_pred - batch_gt) ** 2, dim=(1,2,3))
+    mse = torch.mean((batch_pred - batch_gt) ** 2, dim=(1, 2, 3))
     return torch.mean(20.0 * torch.log10(1.0 / torch.sqrt(mse + eps)))
+
 
 def save_ckpt(state, save_dir, tag):
     save_dir = Path(save_dir)
@@ -31,13 +41,13 @@ def save_ckpt(state, save_dir, tag):
     torch.save(state, path)
     return str(path)
 
+
 # ------------------------- train/eval steps -------------------------
 def run_epoch(model, loader, optimizer, device, train=True, grad_clip=0.0, criterion=nn.MSELoss()):
     model.train(train)
     loss_meter, psnr_meter, n = 0.0, 0.0, 0
     mode = "train" if train else "val"
 
-    # Create progress bar instance
     pbar = tqdm(loader, desc=f"{mode} epoch", leave=False, dynamic_ncols=True)
 
     for noisy, clean in pbar:
@@ -49,6 +59,8 @@ def run_epoch(model, loader, optimizer, device, train=True, grad_clip=0.0, crite
             out = model(noisy)
             loss = criterion(out, clean)
             loss.backward()
+            if grad_clip > 0.0:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
         else:
             with torch.no_grad():
@@ -69,12 +81,14 @@ def run_epoch(model, loader, optimizer, device, train=True, grad_clip=0.0, crite
         raise ValueError("No samples processed — check DataLoader or loop indentation.")
     return loss_meter / n, psnr_meter / n
 
+
 # ------------------------- main -------------------------
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data_root", type=str, required=True,
                    help="DIV2K root with train/ and (optional) val/ pngs")
     p.add_argument("--save_dir", type=str, default="checkpoints")
+    p.add_argument("--model_tag", type=str, default="")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--patch_size", type=int, default=128)
@@ -85,78 +99,156 @@ def main():
     p.add_argument("--grad_clip", type=float, default=0.0)
     p.add_argument("--num_workers", type=int, default=1)
     p.add_argument("--seed", type=int, default=1337)
-    p.add_argument("--resume", type=str, default="", help="path to checkpoint .pth to resume")
-    # model
     p.add_argument("--base_ch", type=int, default=64)
+    p.add_argument("--use_channel_prune", action="store_true")
+    p.add_argument("--channel_prune_sparsity", type=float, default=0.1)
+    p.add_argument("--channel_prune_steps", type=int, default=1)
+    p.add_argument("--use_unstructured_prune", action="store_true")
+    p.add_argument("--unstructured_amount", type=float, default=0.5)
+    p.add_argument("--use_qat", action="store_true")
+
+
     args = p.parse_args()
+
+    print(f"===== training {args.model_tag} =====\n")
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
 
     # ------------------ datasets ------------------
-    train_set = Div2kDataSet(root=args.data_root, split="train",
-                             patch_size=args.patch_size, sigma=args.sigma, augment=True)
-    val_set = Div2kDataSet(root=args.data_root, split="valid",
-                               patch_size=args.patch_size, sigma=args.sigma, augment=False)
+    train_set = Div2kDataSet(
+        root=args.data_root,
+        split="train",
+        patch_size=args.patch_size,
+        sigma=args.sigma,
+        augment=True,
+    )
+    val_set = Div2kDataSet(
+        root=args.data_root,
+        split="valid",
+        patch_size=args.patch_size,
+        sigma=args.sigma,
+        augment=False,
+    )
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True, drop_last=True)
-    val_loader   = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
 
-    # ------------------ model / optim ------------------
-    model = UNetDenoise(in_ch=3, out_ch=3, base_ch=args.base_ch).to(device)
+    # ------------------ model (base UNet) ------------------
+    model = UNetDenoise(
+        in_ch=3,
+        out_ch=3,
+        base_ch=args.base_ch,
+    ).to(device)
+
+    # ------------------ channel pruning  ------------------
+    if args.use_channel_prune:
+        example_input = torch.randn(1, 3, args.patch_size, args.patch_size, device=device)
+        model = apply_channel_pruning(
+            model,
+            example_input=example_input,
+            ch_sparsity=args.channel_prune_sparsity,
+            iterative_steps=args.channel_prune_steps,
+        ).to(device)
+
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    start_epoch, best_psnr = 0, -1.0
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location="cpu")
-        model.load_state_dict(ckpt["model"])
-        opt.load_state_dict(ckpt["opt"])
-        start_epoch = ckpt["epoch"] + 1
-        best_psnr = ckpt.get("best_psnr", best_psnr)
-        print(f"Resumed from {args.resume} @ epoch {start_epoch}, best_psnr={best_psnr:.3f}")
+    # ------------------ QAT setup ------------------
+    if args.use_qat:
+        # QAT is applied on the (possibly channel-pruned) float model
+        example_input = torch.randn(1, 3, args.patch_size, args.patch_size, device=device)
+
+        qconfig = tq.get_default_qat_qconfig("fbgemm")
+        model = prepare_qat_fx(model, {"": qconfig}, example_inputs=(example_input,))
+
+        # Reduce LR for QAT fine-tuning
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr * 0.1, weight_decay=args.weight_decay)
+
+    best_psnr = -1.0
 
     print("starting loop")
     # ------------------ training loop ------------------
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(args.epochs):
         t0 = time.time()
 
-        tr_loss, tr_psnr = run_epoch(model, train_loader, opt, device,
-                                    train=True, grad_clip=args.grad_clip)
-        va_loss, va_psnr = run_epoch(model, val_loader, opt, device,
-                                    train=False)
+        tr_loss, tr_psnr = run_epoch(
+            model, train_loader, opt, device,
+            train=True, grad_clip=args.grad_clip
+        )
+        va_loss, va_psnr = run_epoch(
+            model, val_loader, opt, device,
+            train=False
+        )
 
         elapsed = time.time() - t0
 
-        print(f"[{epoch+1:03d}/{args.epochs}] "
-              f"train: loss={tr_loss:.6f}, psnr={tr_psnr:.2f} | "
-              f"val: loss={va_loss:.6f}, psnr={va_psnr:.2f} | "
-              f"time={elapsed:.1f}s")
+        print(
+            f"[{epoch+1:03d}/{args.epochs}] "
+            f"train: loss={tr_loss:.6f}, psnr={tr_psnr:.2f} | "
+            f"val: loss={va_loss:.6f}, psnr={va_psnr:.2f} | "
+            f"time={elapsed:.1f}s"
+        )
 
-        # save last
-        save_ckpt({
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "opt": opt.state_dict(),
-            "best_psnr": best_psnr,
-            "args": vars(args),
-        }, args.save_dir, "last")
-
-        # save best
+        # track and save best float checkpoint (optionally unstructured-pruned)
         if va_psnr > best_psnr:
             best_psnr = va_psnr
-            path = save_ckpt({
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "opt": opt.state_dict(),
+
+            # clone model for saving so we don't disturb the training model
+            model_for_save = copy.deepcopy(model).cpu()
+
+            if args.use_unstructured_prune:
+                model_for_save = apply_unstructured_pruning(
+                    model_for_save,
+                    amount=args.unstructured_amount,
+                )
+                model_for_save = bake_unstructured_pruning(model_for_save)
+
+            path = save_ckpt(
+                {
+                    "epoch": epoch,
+                    "model": model_for_save.state_dict(),
+                    "best_psnr": best_psnr,
+                    "args": vars(args),
+                },
+                args.save_dir,
+                f"{args.model_tag}_best",
+            )
+            print(f"  ↳ new best ({best_psnr:.2f} dB) saved to {path}")
+
+    # after the training loop, export quantized model if QAT was used
+    if args.use_qat:
+        # for inference, run quantized model on CPU
+        model_cpu = model.to("cpu").eval()
+
+        # convert_fx uses the observer stats collected during QAT
+        quant_model = convert_fx(model_cpu)
+
+        quant_path = save_ckpt(
+            {
+                "epoch": args.epochs - 1,
+                "model": quant_model.state_dict(),
                 "best_psnr": best_psnr,
                 "args": vars(args),
-            }, args.save_dir, "best")
-            print(f"  ↳ new best ({best_psnr:.2f} dB) saved to {path}")
+            },
+            args.save_dir,
+            f"{args.model_tag}_int8_final",
+        )
+        print(f"[info] quantized INT8 model saved to {quant_path}")
+
 
 if __name__ == "__main__":
     main()
-
-
