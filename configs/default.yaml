@@ -7,8 +7,15 @@ data:
   batch_size: 16
   noise_sigma: 25
 
+saves:
+  base_model_name: "base"
+  prune_model_name: "prune"
+  qat_model_name: "qat"
+  qat_prune_model_name: "qat_prune"
+
+
 train:
-  epochs: 50
+  epochs: 1
   lr: 3e-4
   optimizer: "adamw"
   weight_decay: 0.01
