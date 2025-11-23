@@ -1,0 +1,7 @@
+https://pytorch.org/tutorials/
+https://pytorch.org/docs/
+https://github.com/onnx/tutorials
+https://matplotlib.org/stable/tutorials/
+https://arxiv.org/abs/2308.06767
+https://arxiv.org/abs/2205.07877
+https://arxiv.org/abs/2011.00241

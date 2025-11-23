@@ -1,21 +1,22 @@
-import os
 import time
 from pathlib import Path
-from typing import Dict, Tuple
-
+from typing import Dict
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import torch.ao.quantization as tq
 from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx
-import yaml
+import os
+import random
+
 
 from src.model import UNetDenoise, apply_channel_pruning
 from src.data import Div2kDataSet
 
 @torch.no_grad()
-def psnr(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def psnr(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8):
     """Batch PSNR for [0,1] images: (N,C,H,W) -> scalar."""
     mse = torch.mean((pred - target) ** 2, dim=(1, 2, 3))
     return torch.mean(20.0 * torch.log10(1.0 / torch.sqrt(mse + eps)))
@@ -26,9 +27,9 @@ def ssim(
     pred: torch.Tensor,
     target: torch.Tensor,
     C1: float = 0.01 ** 2,
-    C2: float = 0.03 ** 2,
-) -> torch.Tensor:
-    """Very simple SSIM over whole image, per-batch, for [0,1] tensors."""
+    C2: float = 0.03 ** 2
+    ):
+    """SSIM over whole image, per-batch, for [0,1] tensors."""
     mu_x = torch.mean(pred, dim=(2, 3), keepdim=True)
     mu_y = torch.mean(target, dim=(2, 3), keepdim=True)
     sigma_x = torch.var(pred, dim=(2, 3), keepdim=True)
@@ -45,8 +46,7 @@ def ssim(
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
-    device: torch.device,
-) -> Dict[str, float]:
+    device: torch.device):
     """Compute Loss / PSNR / SSIM over our dataloader."""
     model.eval()
     loss_fn = nn.MSELoss()
@@ -75,12 +75,12 @@ def evaluate(
     }
 
 
-def count_params(model: nn.Module) -> int:
+def count_params(model: nn.Module):
     """Total number of trainable parameters."""
     return sum(p.numel() for p in model.parameters())
 
 
-def model_sparsity(model: nn.Module) -> float:
+def model_sparsity(model: nn.Module):
     """Fraction of weights that are exactly zero."""
     zero = 0
     total = 0
@@ -91,6 +91,100 @@ def model_sparsity(model: nn.Module) -> float:
     return zero / total if total > 0 else 0.0
 
 
+def visualize_all_models(
+    num_samples: int = 6,
+    patch_size: int = 128,
+    sigma: float = 25.0,
+    device: torch.device = "cpu",
+):
+    """ Visualize every model output for comparison """
+
+    device = torch.device(device)
+
+    # Paths
+    DATA_ROOT = os.getenv("DATA_ROOT", "/path/to/DIV2K")
+    SAVE_DIR = Path(os.getenv("SAVE_DIR", "checkpoints"))
+
+    # Load all 4 models
+    models = {}
+    models["base"], _ = load_float_model(SAVE_DIR / "base_best.pth", device=device)
+    models["prune"], _ = load_float_model(SAVE_DIR / "prune_best.pth", device=device)
+    models["qat"], _ = load_quant_model(SAVE_DIR / "qat_int8_final.pth", device=device)
+    models["qat_prune"], _ = load_quant_model(
+        SAVE_DIR / "qat_prune_int8_final.pth", device=device
+    )
+
+    for m in models.values():
+        m.eval()
+
+    # Validation data
+    val_set = Div2kDataSet(
+        root=DATA_ROOT,
+        split="valid",
+        patch_size=patch_size,
+        sigma=sigma,
+        augment=False,
+    )
+
+    num_samples = min(num_samples, len(val_set))
+    samples = random.sample(range(len(val_set)), num_samples)
+
+    model_names = ["base", "prune", "qat", "qat_prune"]
+    num_cols = 2 + len(model_names)
+
+    fig, axes = plt.subplots(
+        num_samples, num_cols, figsize=(3 * num_cols, 3 * num_samples)
+    )
+    if num_samples == 1:
+        axes = [axes]
+
+    def to_np(t: torch.Tensor):
+        return (
+            t.squeeze(0)
+            .permute(1, 2, 0)
+            .cpu()
+            .clamp(0, 1)
+            .numpy()
+        )
+
+    for row_idx, idx in enumerate(samples):
+        noisy, clean = val_set[idx]
+        noisy_b = noisy.unsqueeze(0).to(device)
+
+        # run all models on same noisy patch
+        with torch.no_grad():
+            preds = {name: models[name](noisy_b) for name in model_names}
+
+        # convert images
+        noisy_np = to_np(noisy_b)
+        clean_np = to_np(clean.unsqueeze(0))
+        preds_np = {k: to_np(v) for k, v in preds.items()}
+
+        col = 0
+
+        # noisy
+        axes[row_idx][col].imshow(noisy_np)
+        axes[row_idx][col].set_title("Noisy")
+        axes[row_idx][col].axis("off")
+        col += 1
+
+        # each model prediction
+        for name in model_names:
+            axes[row_idx][col].imshow(preds_np[name])
+            axes[row_idx][col].set_title(name)
+            axes[row_idx][col].axis("off")
+            col += 1
+
+        # clean
+        axes[row_idx][col].imshow(clean_np)
+        axes[row_idx][col].set_title("Clean")
+        axes[row_idx][col].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+    return fig, axes
+
+
 @torch.no_grad()
 def benchmark_model(
     model: nn.Module,
@@ -98,10 +192,9 @@ def benchmark_model(
     input_shape=(1, 3, 128, 128),
     warmup: int = 10,
     runs: int = 50,
-) -> Tuple[float, float]:
-    """
-    Returns (mean_ms, std_ms) over `runs` iterations.
-    """
+    ):
+
+    """Returns (mean_ms, std_ms) over `runs` iterations"""
     model = model.to(device).eval()
     x = torch.randn(*input_shape, device=device)
 
@@ -119,7 +212,7 @@ def benchmark_model(
     return float(arr.mean()), float(arr.std())
 
 
-def build_base_or_pruned_unet_from_args(args: dict, device: torch.device) -> Tuple[nn.Module, int]:
+def build_base_or_pruned_unet_from_args(args: dict, device: torch.device):
     """
     Rebuild a float UNet (base or channel-pruned) using the args stored in the checkpoint.
     Returns (model, patch_size).
@@ -154,19 +247,10 @@ def build_base_or_pruned_unet_from_args(args: dict, device: torch.device) -> Tup
 
 def load_float_model(
     ckpt_path: Path,
-    device: torch.device,
-) -> Tuple[nn.Module, int]:
+    device: torch.device):
     """
-    Load a float model (base or channel-pruned) from a _best.pth checkpoint.
+    Load a float model (base or channel-pruned) from checkpoint."""
 
-    The checkpoint structure is assumed to be:
-        {
-          "epoch": ...,
-          "model": state_dict,
-          "best_psnr": ...,
-          "args": vars(args),
-        }
-    """
     ckpt = torch.load(ckpt_path, map_location="cpu")
     args = ckpt.get("args", {})
 
@@ -178,45 +262,32 @@ def load_float_model(
 
 def load_quant_model(
     ckpt_path: Path,
-    device: torch.device,
-) -> Tuple[nn.Module, int]:
+    device: torch.device):
     """
-    Load a QAT / QAT+channel-pruned checkpoint as a quantized INT8 FX model.
-
-    We:
-      - Rebuild the base/pruned UNet from args,
-      - Rebuild the QAT FX graph using the same qconfig + example_input logic,
-      - Convert to a quantized FX model via convert_fx,
-      - Load the saved INT8 state_dict into that quantized model.
-
-    This allows us to benchmark *true* INT8 latency and quality.
+    Load a QAT or QAT+channel-pruned .pth file as a INT 8 model.
     """
     ckpt = torch.load(ckpt_path, map_location="cpu")
     args = ckpt.get("args", {})
 
-    # Build float base/pruned architecture on CPU
+    # Build float architecture on CPU
     cpu_device = torch.device("cpu")
     float_model, patch_size = build_base_or_pruned_unet_from_args(args, cpu_device)
 
-    # Rebuild QAT FX graph + quantized FX graph template
+    # Rebuild
     example_input = torch.randn(1, 3, patch_size, patch_size, device=cpu_device)
     qconfig = tq.get_default_qat_qconfig("fbgemm")
     qat_model = prepare_qat_fx(float_model, {"": qconfig}, example_inputs=(example_input,))
     quant_model = convert_fx(qat_model.eval())
 
-    # Load saved INT8 state_dict (weights + scales) into this quant graph
+    # Load saved INT8 state_dict
     quant_sd = ckpt["model"]
-    missing, unexpected = quant_model.load_state_dict(quant_sd, strict=False)
-    if unexpected:
-        print(f"[Eval QAT] Ignoring {len(unexpected)} unexpected keys (aux buffers).")
-    if missing:
-        print(f"[Eval QAT] {len(missing)} missing keys kept at init values.")
+    quant_model.load_state_dict(quant_sd, strict=False)
 
     quant_model.to(device).eval()
     return quant_model, patch_size
 
 
-def build_val_loader(data_root: Path, cfg: dict) -> DataLoader:
+def build_val_loader(data_root: Path, cfg: dict):
     """Build DIV2K validation loader using cfg[data]."""
     patch_size = int(cfg["data"]["patch_size"])
     sigma = float(cfg["data"].get("sigma", 25.0))
@@ -242,21 +313,11 @@ def evaluate_all_models(
     cfg: dict,
     data_root: Path,
     save_dir: Path,
-    device: torch.device,
-) -> Dict[str, Dict[str, float]]:
+    device: torch.device):
     """
-    Run full evaluation for:
-      - base        (float)
-      - prune       (float, channel-pruned)
-      - qat         (INT8)
-      - qat_prune   (INT8, channel-pruned)
+    Run full evaluation for all 4 models
 
-    Returns:
-      results[name] = {
-          Loss, PSNR, SSIM,
-          Params, Sparsity,
-          Size_MB, Latency_ms_mean, Latency_ms_std,
-      }
+    Returns a dictionary of results
     """
     val_loader = build_val_loader(data_root, cfg)
 
@@ -285,6 +346,7 @@ def evaluate_all_models(
 
     results: Dict[str, Dict[str, float]] = {}
 
+    # loop through each model
     for name, conf in variants.items():
         tag = conf["tag"]
         ckpt_path = save_dir / f"{tag}{conf['ckpt_suffix']}"
@@ -293,7 +355,7 @@ def evaluate_all_models(
         print(f"\n===== {name.upper()} =====")
         print(f"CKPT: {ckpt_path}")
 
-        # Load model (float or quantized)
+        # Load model
         if conf["quant"]:
             model, patch_size = load_quant_model(ckpt_path, device=device)
         else:
@@ -302,15 +364,15 @@ def evaluate_all_models(
         # Quality metrics
         qa = evaluate(model, val_loader, device)
 
-        # Params / sparsity
+        # Params and sparsity
         model_cpu = model.to("cpu")
         params = count_params(model_cpu)
         sparsity = model_sparsity(model_cpu)
 
-        # Checkpoint size
+        # model size
         size_mb = ckpt_path.stat().st_size / (1024 ** 2)
 
-        # Latency on CPU (batch=1, patch_size from checkpoint)
+        # Latency on CPU
         lat_mean, lat_std = benchmark_model(
             model_cpu, torch.device("cpu"),
             input_shape=(1, 3, patch_size, patch_size)
@@ -319,15 +381,16 @@ def evaluate_all_models(
         results[name] = {
             "Loss": qa["Loss"],
             "PSNR": qa["PSNR"],
-            "SSIM": qa["SSIM"],
+             "SSIM": qa["SSIM"],
             "Params": params,
             "Sparsity": sparsity,
             "Size_MB": size_mb,
             "Latency_ms_mean": lat_mean,
             "Latency_ms_std": lat_std,
-        }
+            }
 
-    # 
+    # here we are replacing sparcity resuts for QAT models as we cant measure it properly on QAT models
+    # This is fine as the values would be the same. this is just for the purpose of result visualization.
     if "base" in results and "qat" in results:
         results["qat"]["Params"] = results["base"]["Params"]
         results["qat"]["Sparsity"] = results["base"]["Sparsity"]
@@ -335,13 +398,12 @@ def evaluate_all_models(
     if "prune" in results and "qat_prune" in results:
         results["qat_prune"]["Params"] = results["prune"]["Params"]
         results["qat_prune"]["Sparsity"] = results["prune"]["Sparsity"]
-
     return results
 
 
 
-def print_summary_table(results: Dict[str, Dict[str, float]]) -> None:
-    """Pretty-print a summary table with deltas vs base."""
+def print_summary_table(results: Dict[str, Dict[str, float]]):
+    """print a summary table"""
     base = results["base"]
     base_psnr = base["PSNR"]
     base_ssim = base["SSIM"]
@@ -387,31 +449,3 @@ def print_summary_table(results: Dict[str, Dict[str, float]]) -> None:
             f"{ssim_v:5.4f}  "
             f"{d_ssim:+6.4f}"
         )
-
-
-def main():
-    """CLI entrypoint: read env/cfg, evaluate all models, print summary."""
-    REPO_DIR = os.getenv("REPO_DIR")
-    DATA_ROOT = os.getenv("DATA_ROOT")
-    SAVE_DIR = os.getenv("SAVE_DIR")
-
-    assert REPO_DIR is not None, "REPO_DIR env var must be set"
-    assert DATA_ROOT is not None, "DATA_ROOT env var must be set"
-    assert SAVE_DIR is not None, "SAVE_DIR env var must be set"
-
-    repo_path = Path(REPO_DIR)
-    data_root = Path(DATA_ROOT)
-    save_dir = Path(SAVE_DIR)
-
-    with open(repo_path / "configs" / "default.yaml", "r") as f:
-        cfg = yaml.safe_load(f)
-
-    device = torch.device("cpu")  # use CPU for fair quantized speed comparison
-    print(f"Using device for PyTorch eval: {device}")
-
-    results = evaluate_all_models(cfg, data_root, save_dir, device=device)
-    print_summary_table(results)
-
-
-if __name__ == "__main__":
-    main()

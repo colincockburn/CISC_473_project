@@ -1,11 +1,11 @@
-# src/model.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.nn.utils.prune as prune  # for unstructured pruning
-
+import torch.nn.utils.prune as prune  
+import torch_pruning as tp
 
 class DoubleConv(nn.Module):
+    """ reusable convolution layer to be stacked in model """
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.conv = nn.Sequential(
@@ -22,6 +22,7 @@ class DoubleConv(nn.Module):
 
 
 class Down(nn.Module):
+    """ endconding down section of Unet"""
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.pool = nn.MaxPool2d(2)
@@ -32,11 +33,11 @@ class Down(nn.Module):
 
 
 class Up(nn.Module):
+    """ decoding up section of Unet"""
     def __init__(self, c_in, c_skip, c_out=None):
         super().__init__()
         if c_out is None:
             c_out = c_skip
-        # upsample + 1x1 conv instead of ConvTranspose2d
         self.up = nn.Upsample(scale_factor=2, mode="nearest")
         self.proj = nn.Conv2d(c_in, c_skip, kernel_size=1, bias=False)
         self.conv = DoubleConv(2 * c_skip, c_out)
@@ -45,7 +46,6 @@ class Up(nn.Module):
         x = self.up(x)
         x = self.proj(x)
 
-        # keep the padding logic FX-friendly
         dh = skip.size(-2) - x.size(-2)
         dw = skip.size(-1) - x.size(-1)
         x = F.pad(x, (0, dw, 0, dh))
@@ -54,13 +54,7 @@ class Up(nn.Module):
 
 
 class UNetDenoise(nn.Module):
-    """
-    Plain UNet denoiser.
-
-    Compression is applied externally via:
-      - apply_channel_pruning(...)  -> structured channel pruning (size + latency)
-      - apply_unstructured_pruning(...) -> unstructured sparsity on weights
-    """
+    """ our UNet denoiser model class."""
 
     def __init__(self, in_ch: int = 3, out_ch: int = 3, base_ch: int = 64):
         super().__init__()
@@ -101,20 +95,15 @@ def apply_channel_pruning(
     ch_sparsity: float = 0.5,
     iterative_steps: int = 1,
 ):
-    try:
-        import torch_pruning as tp
-    except ImportError as e:
-        raise ImportError(
-            "torch_pruning is required for channel-removal pruning. "
-            "Install with: pip install torch-pruning"
-        ) from e
+    """ pruning entire channels lets us reduce model size. This function implements
+    channel pruning
+    """
+    # pruning needs eval mode
+    model.eval()
 
-    model.eval()  # pruning itself runs in eval mode
-
-    # Global importance: L2-norm magnitude of channels
     imp = tp.importance.MagnitudeImportance(p=2)
 
-    # Don't prune the final conv mapping to RGB (3 channels)
+    # Don't prune the final conv
     ignored_layers = [model.outc]
 
     pruner = tp.pruner.MagnitudePruner(
@@ -126,31 +115,15 @@ def apply_channel_pruning(
         ignored_layers=ignored_layers,
     )
 
-    print(
-        f"[ChannelPruning] Starting channel pruning with "
-        f"ch_sparsity={ch_sparsity}, iterative_steps={iterative_steps}"
-    )
-
     for _ in range(iterative_steps):
         pruner.step()
 
-    print("[ChannelPruning] Pruning complete. Model now has fewer channels.")
     return model
 
 
-# ----------------------------------------------------------------------
 # Unstructured pruning (sparsity on top of structured pruning)
-# ----------------------------------------------------------------------
 def apply_unstructured_pruning(model: nn.Module, amount: float = 0.5) -> nn.Module:
-    """
-    Apply L1 unstructured pruning to all Conv2d weights.
-
-    This:
-      - Zeroes individual weights inside kernels (unstructured sparsity),
-      - Keeps tensor shapes the same (no extra FLOP/latency reduction),
-      - Mainly useful to report additional sparsity on top of channel pruning.
-    """
-    print(f"[UnstructuredPruning] Applying L1 unstructured pruning with amount={amount}")
+    """ applys unstructired pruning """
     for m in model.modules():
         if isinstance(m, nn.Conv2d):
             prune.l1_unstructured(m, name="weight", amount=amount)
@@ -160,8 +133,7 @@ def apply_unstructured_pruning(model: nn.Module, amount: float = 0.5) -> nn.Modu
 def bake_unstructured_pruning(model: nn.Module) -> nn.Module:
     """
     Remove pruning reparam (weight_orig + mask) and keep only dense `weight`
-    tensors with zeros baked in. This avoids reparam in saved checkpoints and
-    keeps QAT / FX graph building simple.
+    tensors with zeros baked in. This just makes combining with QAT a bit easier
     """
     for m in model.modules():
         if isinstance(m, nn.Conv2d) and hasattr(m, "weight_orig"):
