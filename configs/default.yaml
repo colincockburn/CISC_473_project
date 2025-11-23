@@ -15,7 +15,7 @@ saves:
 
 
 train:
-  epochs: 1
+  epochs: 50
   lr: 3e-4
   optimizer: "adamw"
   weight_decay: 0.01

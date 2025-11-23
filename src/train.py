@@ -101,7 +101,7 @@ def main():
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--base_ch", type=int, default=64)
     p.add_argument("--use_channel_prune", action="store_true")
-    p.add_argument("--channel_prune_sparsity", type=float, default=0.1)
+    p.add_argument("--channel_prune_sparsity", type=float, default=0.2)
     p.add_argument("--channel_prune_steps", type=int, default=1)
     p.add_argument("--use_unstructured_prune", action="store_true")
     p.add_argument("--unstructured_amount", type=float, default=0.5)
